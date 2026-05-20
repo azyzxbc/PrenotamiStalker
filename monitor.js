@@ -292,14 +292,16 @@ class PrenotamiMonitor {
       }
 
       // Poll URL until we land on prenotami or timeout
+      // IMPORTANT: use startsWith, NOT includes — the SSO URL contains
+      // 'prenotami.esteri.it' in its goto= query parameter!
       while (Date.now() - loginStart < loginTimeout) {
         await new Promise(r => setTimeout(r, 3000));
         const currentUrl = this.page.url();
-        if (currentUrl.includes('prenotami.esteri.it')) {
+        if (currentUrl.startsWith('https://prenotami.esteri.it')) {
           loggedIn = true;
           break;
         }
-        log('INFO', `Still waiting... URL: ${currentUrl.substring(0, 60)}...`);
+        log('INFO', `Still waiting... URL: ${currentUrl.substring(0, 80)}...`);
         // Try to catch another navigation
         try {
           await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 5000 });
