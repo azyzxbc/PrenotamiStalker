@@ -289,6 +289,21 @@ class PrenotamiMonitor {
         await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 });
       } catch (e) {
         log('INFO', 'First navigation wait timed out, polling URL...');
+        // DEBUG: capture what the SSO page shows after submit
+        try {
+          const debugText = await this.page.evaluate(() => document.body.innerText);
+          const debugHtml = await this.page.evaluate(() => document.body.innerHTML.substring(0, 2000));
+          log('INFO', `[DEBUG] Page text after submit: ${debugText.substring(0, 500)}`);
+          // Check for common SSO errors
+          if (debugText.includes('Invalid') || debugText.includes('incorrect') || debugText.includes('Errore')) {
+            log('ERROR', '[DEBUG] SSO shows an error message! Credentials may be wrong.');
+          }
+          if (debugHtml.includes('captcha') || debugHtml.includes('challenge') || debugHtml.includes('recaptcha')) {
+            log('ERROR', '[DEBUG] CAPTCHA detected on SSO page!');
+          }
+        } catch (debugErr) {
+          log('WARNING', `[DEBUG] Could not capture page content: ${debugErr.message}`);
+        }
       }
 
       // Poll URL until we land on prenotami or timeout
