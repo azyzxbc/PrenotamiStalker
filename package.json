@@ -1,0 +1,16 @@
+{
+  "name": "prenotami-monitor",
+  "version": "1.0.0",
+  "description": "Monitor prenotami.esteri.it for available appointment slots and send WhatsApp notifications",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js",
+    "setup": "node monitor.js --setup",
+    "test-telegram": "node monitor.js --test-telegram",
+    "test-sound": "node monitor.js --test-sound"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0",
+    "dotenv": "^16.4.7"
+  }
+}
