@@ -279,28 +279,39 @@ class PrenotamiMonitor {
       await this.page.click('button[type="submit"]');
       log('INFO', 'Submitted login, waiting for redirect...');
 
-      // Wait for redirect back to prenotami
-      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+      // Wait for redirect back to prenotami — use polling fallback for slow SSO
+      const loginStart = Date.now();
+      const loginTimeout = 60000; // 60 seconds
+      let loggedIn = false;
 
-      // Sometimes there's a second redirect
-      await new Promise(r => setTimeout(r, 3000));
-      const finalUrl = this.page.url();
+      // Try waitForNavigation first (may catch fast redirects)
+      try {
+        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 });
+      } catch (e) {
+        log('INFO', 'First navigation wait timed out, polling URL...');
+      }
 
-      if (finalUrl.includes('prenotami.esteri.it')) {
+      // Poll URL until we land on prenotami or timeout
+      while (Date.now() - loginStart < loginTimeout) {
+        await new Promise(r => setTimeout(r, 3000));
+        const currentUrl = this.page.url();
+        if (currentUrl.includes('prenotami.esteri.it')) {
+          loggedIn = true;
+          break;
+        }
+        log('INFO', `Still waiting... URL: ${currentUrl.substring(0, 60)}...`);
+        // Try to catch another navigation
+        try {
+          await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 5000 });
+        } catch (e) { /* keep polling */ }
+      }
+
+      if (loggedIn) {
+        const finalUrl = this.page.url();
         log('SUCCESS', `Logged in! URL: ${finalUrl}`);
         return true;
       } else {
-        log('WARNING', `Unexpected URL after login: ${finalUrl}`);
-        // Try waiting for another redirect
-        try {
-          await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
-        } catch (e) { /* no more redirects */ }
-        const url2 = this.page.url();
-        if (url2.includes('prenotami.esteri.it')) {
-          log('SUCCESS', `Logged in after extra wait! URL: ${url2}`);
-          return true;
-        }
-        log('ERROR', `Login failed. Final URL: ${url2}`);
+        log('ERROR', `Login timed out after 60s. Final URL: ${this.page.url()}`);
         return false;
       }
     } catch (error) {
@@ -423,11 +434,22 @@ class PrenotamiMonitor {
 
     await this.init();
 
-    // Auto-login on start
-    const loggedIn = await this.login();
+    // Auto-login on start (retry up to 3 times)
+    let loggedIn = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      log('INFO', `Login attempt ${attempt}/3...`);
+      loggedIn = await this.login();
+      if (loggedIn) break;
+      if (attempt < 3) {
+        log('WARNING', `Login attempt ${attempt} failed, retrying in 30s...`);
+        await new Promise(r => setTimeout(r, 30000));
+      }
+    }
     if (!loggedIn) {
-      log('ERROR', 'Initial login failed! Check your credentials.');
-      process.exit(1);
+      log('ERROR', 'All 3 login attempts failed! Check your credentials.');
+      log('ERROR', 'Waiting 5 minutes before retrying...');
+      await new Promise(r => setTimeout(r, 300000));
+      process.exit(1); // pm2 will restart the process
     }
 
     // Main monitoring loop
