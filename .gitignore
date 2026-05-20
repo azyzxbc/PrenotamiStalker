@@ -1,5 +1,7 @@
 node_modules/
 chrome-profile/
+chrome-profile-debug/
+chrome-profile-debug2/
 .env
 debug-*.js
 debug-*.html
