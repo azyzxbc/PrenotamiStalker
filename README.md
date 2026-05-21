@@ -176,10 +176,13 @@ sudo apt install -y xvfb
 
 ```bash
 # Depuis votre PC (PowerShell/cmd)
-scp -r C:\Users\azizb\.gemini\antigravity\scratch\prenotami-monitor\monitor.js user@VPS_IP:~/prenotami-monitor/
-scp C:\Users\azizb\.gemini\antigravity\scratch\prenotami-monitor\package.json user@VPS_IP:~/prenotami-monitor/
-scp C:\Users\azizb\.gemini\antigravity\scratch\prenotami-monitor\.env user@VPS_IP:~/prenotami-monitor/
-scp C:\Users\azizb\.gemini\antigravity\scratch\prenotami-monitor\.gitignore user@VPS_IP:~/prenotami-monitor/
+cd C:\prenotami-monitor
+
+# Puis copiez les fichiers vers le VPS
+scp monitor.js user@VPS_IP:~/prenotami-monitor/
+scp package.json user@VPS_IP:~/prenotami-monitor/
+scp .env user@VPS_IP:~/prenotami-monitor/
+scp .gitignore user@VPS_IP:~/prenotami-monitor/
 ```
 
 Ou bien créez les fichiers directement sur le VPS.
