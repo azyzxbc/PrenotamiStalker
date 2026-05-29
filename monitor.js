@@ -1,15 +1,14 @@
 /**
- * Prenotami Appointment Monitor v2
+ * Prenotami Appointment Monitor v3 — Auto-Booking Edition
  * 
- * Uses your existing Chrome session cookies to avoid bot detection.
  * Monitors https://prenotami.esteri.it/Services/Booking/2359 for slots
- * and sends Telegram notifications + sound alarm.
+ * and AUTOMATICALLY books the first available appointment.
  * 
- * IMPORTANT: You must be logged into prenotami.esteri.it in Chrome first!
- * Close Chrome completely before running this script.
+ * Flow: detect slots → fill form → click AVANTI → handle calendar → 
+ *       submit booking → notify user for OTP email verification
  * 
  * Usage:
- *   node monitor.js                  - Start monitoring
+ *   node monitor.js                  - Start monitoring + auto-booking
  *   node monitor.js --test-telegram  - Send a test Telegram message
  *   node monitor.js --test-sound     - Test the alarm sound
  */
@@ -69,6 +68,8 @@ const CONFIG = {
   bookingUrl: process.env.BOOKING_URL || 'https://prenotami.esteri.it/Services/Booking/2359',
   loginUrl: 'https://prenotami.esteri.it/Home',
   noSlotsMessage: 'Sorry, all appointments for this service are currently booked',
+  autoBook: (process.env.AUTO_BOOK || 'true').toLowerCase() === 'true',
+  bookingNote: process.env.BOOKING_NOTE || '',
 };
 
 // ============================================================================
@@ -135,6 +136,65 @@ function sendTelegram(message) {
       log('ERROR', `Telegram notification failed: ${err.message}`);
       reject(err);
     });
+  });
+}
+
+// ============================================================================
+// Telegram Photo (send screenshots)
+// ============================================================================
+
+function sendTelegramPhoto(imagePath, caption) {
+  return new Promise((resolve, reject) => {
+    if (!CONFIG.telegramBotToken || !CONFIG.telegramChatId) {
+      resolve(null);
+      return;
+    }
+    try {
+      const http = require('https');
+      const FormData = require('form-data') || null;
+      // Use multipart manually since form-data might not be installed
+      const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+      const fileData = fs.readFileSync(imagePath);
+      const fileName = path.basename(imagePath);
+      
+      let body = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${CONFIG.telegramChatId}\r\n`),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${(caption || '').substring(0, 1024)}\r\n`),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${fileName}"\r\nContent-Type: image/png\r\n\r\n`),
+        fileData,
+        Buffer.from(`\r\n--${boundary}--\r\n`),
+      ]);
+
+      const options = {
+        hostname: 'api.telegram.org',
+        path: `/bot${CONFIG.telegramBotToken}/sendPhoto`,
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length,
+        },
+      };
+
+      const req = http.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            log('SUCCESS', 'Screenshot sent to Telegram!');
+            resolve(data);
+          } else {
+            log('ERROR', `Telegram photo API returned ${res.statusCode}: ${data}`);
+            reject(new Error(`Telegram photo error: ${res.statusCode}`));
+          }
+        });
+      });
+      req.on('error', (err) => reject(err));
+      req.write(body);
+      req.end();
+    } catch (err) {
+      log('ERROR', `sendTelegramPhoto failed: ${err.message}`);
+      reject(err);
+    }
   });
 }
 
@@ -337,6 +397,314 @@ class PrenotamiMonitor {
     }
   }
 
+  // ========================================================================
+  // AUTO-BOOKING: Attempt to book the first available slot
+  // ========================================================================
+
+  async takeScreenshot(label) {
+    try {
+      const screenshotDir = path.join(__dirname, 'screenshots');
+      if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
+      const filename = `${label}-${Date.now()}.png`;
+      const filepath = path.join(screenshotDir, filename);
+      await this.page.screenshot({ path: filepath, fullPage: true });
+      log('INFO', `📸 Screenshot saved: ${filename}`);
+      // Send to Telegram
+      try {
+        await sendTelegramPhoto(filepath, `📸 ${label}`);
+      } catch (e) {
+        log('WARNING', `Failed to send screenshot to Telegram: ${e.message}`);
+      }
+      return filepath;
+    } catch (e) {
+      log('ERROR', `Screenshot failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  async autoBook() {
+    log('SUCCESS', '🤖 AUTO-BOOKING: Starting automatic booking process...');
+    
+    try {
+      // Step 0: Screenshot the booking page as we found it
+      await this.takeScreenshot('01-slots-detected');
+      const pageText = await this.page.evaluate(() => document.body.innerText);
+      const pageHtml = await this.page.evaluate(() => document.body.innerHTML);
+      log('INFO', `[AUTOBOOK] Page text (500 chars): ${pageText.substring(0, 500)}`);
+
+      // Step 1: Check if there's a booking form (#bookingForm)
+      const hasBookingForm = await this.page.evaluate(() => !!document.getElementById('bookingForm'));
+      if (!hasBookingForm) {
+        log('WARNING', '[AUTOBOOK] No #bookingForm found on page. Taking screenshot and notifying...');
+        await this.takeScreenshot('02-no-form');
+        return false;
+      }
+      log('INFO', '[AUTOBOOK] Found #bookingForm!');
+
+      // Step 2: Handle "Tipo Prenotazione" dropdown if present
+      const hasTypeDropdown = await this.page.evaluate(() => {
+        const ddl = document.getElementById('typeofbookingddl');
+        if (!ddl) return false;
+        // Select the first non-zero option
+        for (let i = 0; i < ddl.options.length; i++) {
+          if (ddl.options[i].value !== '0' && ddl.options[i].value !== '') {
+            ddl.selectedIndex = i;
+            ddl.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+        }
+        return false;
+      });
+      if (hasTypeDropdown) {
+        log('INFO', '[AUTOBOOK] Selected booking type from dropdown.');
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      // Step 3: Fill any required text fields (DatiAddizionali)
+      const filledFields = await this.page.evaluate((bookingNote) => {
+        const filled = [];
+        // Fill text inputs that are required and empty
+        document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="text"]').forEach(input => {
+          if (!input.value && input.offsetParent !== null) {
+            // Use booking note or a placeholder
+            input.value = bookingNote || 'N/A';
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            filled.push(input.name);
+          }
+        });
+        // Fill date inputs that are empty with a future date
+        document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="date"]').forEach(input => {
+          if (!input.value && input.offsetParent !== null) {
+            const future = new Date();
+            future.setFullYear(future.getFullYear() + 2);
+            input.value = future.toISOString().split('T')[0];
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            filled.push(input.name);
+          }
+        });
+        // Handle select dropdowns (pick first non-zero option)
+        document.querySelectorAll('select[id*="ddls_"]').forEach(sel => {
+          if (sel.selectedIndex === 0 && sel.offsetParent !== null) {
+            for (let i = 1; i < sel.options.length; i++) {
+              if (sel.options[i].value !== '0') {
+                sel.selectedIndex = i;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                filled.push(sel.id);
+                break;
+              }
+            }
+          }
+        });
+        return filled;
+      }, CONFIG.bookingNote);
+      if (filledFields.length > 0) {
+        log('INFO', `[AUTOBOOK] Filled ${filledFields.length} form fields: ${filledFields.join(', ')}`);
+      }
+
+      await this.takeScreenshot('02-form-filled');
+      await new Promise(r => setTimeout(r, 1000));
+
+      // Step 4: Override window.confirm to auto-accept
+      await this.page.evaluate(() => {
+        window.confirm = () => true;
+      });
+      log('INFO', '[AUTOBOOK] Overrode window.confirm() to auto-accept.');
+
+      // Step 5: Click AVANTI button
+      const hasAvanti = await this.page.evaluate(() => !!document.getElementById('btnAvanti'));
+      if (hasAvanti) {
+        log('INFO', '[AUTOBOOK] Clicking AVANTI...');
+        
+        // Listen for form submission or navigation
+        const navigationPromise = this.page.waitForNavigation({ 
+          waitUntil: 'networkidle2', 
+          timeout: 30000 
+        }).catch(() => null);
+
+        await this.page.click('#btnAvanti');
+        await new Promise(r => setTimeout(r, 3000));
+        
+        // Wait for potential navigation from form submit
+        await navigationPromise;
+        await new Promise(r => setTimeout(r, 3000));
+        
+        await this.takeScreenshot('03-after-avanti');
+        log('INFO', `[AUTOBOOK] After AVANTI, URL: ${this.page.url()}`);
+      } else {
+        log('WARNING', '[AUTOBOOK] No #btnAvanti found, looking for other submit buttons...');
+        // Try clicking any visible submit/book button
+        const clicked = await this.page.evaluate(() => {
+          const btns = document.querySelectorAll('button[type="submit"], input[type="submit"], .btn-primary');
+          for (const btn of btns) {
+            if (btn.offsetParent !== null && btn.innerText && !btn.innerText.includes('Disconnetti')) {
+              btn.click();
+              return btn.innerText.trim();
+            }
+          }
+          return null;
+        });
+        if (clicked) {
+          log('INFO', `[AUTOBOOK] Clicked button: "${clicked}"`);
+          await new Promise(r => setTimeout(r, 5000));
+          await this.takeScreenshot('03-after-submit');
+        }
+      }
+
+      // Step 6: Handle calendar if present (select first available green date)
+      await new Promise(r => setTimeout(r, 2000));
+      const calendarResult = await this.page.evaluate(() => {
+        // Look for calendar day cells
+        const days = document.querySelectorAll('td.day:not(.disabled):not(.old):not(.new), .ui-datepicker td a, .calendar-day.available, td[data-date]');
+        for (const day of days) {
+          const style = window.getComputedStyle(day);
+          // Click first non-disabled, visible day
+          if (day.offsetParent !== null && !day.classList.contains('disabled')) {
+            day.click();
+            return { clicked: true, text: day.innerText.trim(), class: day.className };
+          }
+        }
+        // Also try any green-colored elements
+        const greenEls = document.querySelectorAll('[style*="green"], .bg-success, .available');
+        for (const el of greenEls) {
+          if (el.offsetParent !== null) {
+            el.click();
+            return { clicked: true, text: el.innerText.trim(), class: el.className, type: 'green' };
+          }
+        }
+        return { clicked: false };
+      });
+      
+      if (calendarResult.clicked) {
+        log('SUCCESS', `[AUTOBOOK] Selected date: ${calendarResult.text} (${calendarResult.class})`);
+        await new Promise(r => setTimeout(r, 2000));
+        await this.takeScreenshot('04-date-selected');
+        
+        // Try to select a time slot if time picker appears
+        await new Promise(r => setTimeout(r, 2000));
+        const timeResult = await this.page.evaluate(() => {
+          const timeSlots = document.querySelectorAll('.time-slot, select[id*="time"] option, input[type="radio"][name*="time"], .slot-available');
+          for (const slot of timeSlots) {
+            if (slot.offsetParent !== null && !slot.disabled) {
+              slot.click();
+              return { selected: true, text: slot.innerText || slot.value };
+            }
+          }
+          // Try select dropdown for time
+          const timeSelect = document.querySelector('select[id*="ora"], select[id*="time"], select[id*="Time"]');
+          if (timeSelect && timeSelect.options.length > 1) {
+            timeSelect.selectedIndex = 1;
+            timeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            return { selected: true, text: timeSelect.options[1].text };
+          }
+          return { selected: false };
+        });
+        if (timeResult.selected) {
+          log('SUCCESS', `[AUTOBOOK] Selected time: ${timeResult.text}`);
+        }
+        
+        // Click confirm/prenota after date+time selection
+        await new Promise(r => setTimeout(r, 1000));
+        const confirmResult = await this.page.evaluate(() => {
+          window.confirm = () => true;
+          const btns = document.querySelectorAll('#btnAvanti, #btnPrenota, button[type="submit"], .btn-primary');
+          for (const btn of btns) {
+            if (btn.offsetParent !== null && !btn.innerText.includes('Disconnetti') && !btn.innerText.includes('TORNA')) {
+              btn.click();
+              return btn.innerText.trim();
+            }
+          }
+          return null;
+        });
+        if (confirmResult) {
+          log('INFO', `[AUTOBOOK] Clicked confirm: "${confirmResult}"`);
+          try {
+            await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+          } catch(e) {}
+          await new Promise(r => setTimeout(r, 3000));
+          await this.takeScreenshot('05-after-confirm');
+        }
+      }
+
+      // Step 7: Check for OTP popup/form
+      const currentText = await this.page.evaluate(() => document.body.innerText);
+      const currentHtml = await this.page.evaluate(() => document.body.innerHTML);
+      const hasOtp = currentHtml.includes('OTP') || currentHtml.includes('otp') || currentHtml.includes('GenerateOTP');
+      const hasOtpInput = await this.page.evaluate(() => {
+        return !!document.querySelector('input[id*="otp"], input[id*="OTP"], input[name*="otp"], input[name*="OTP"]');
+      });
+
+      if (hasOtp || hasOtpInput) {
+        log('SUCCESS', '🔐 [AUTOBOOK] OTP step detected! Sending OTP request...');
+        
+        // Try to click the "Send OTP" button
+        const otpSent = await this.page.evaluate(() => {
+          const btn = document.getElementById('otp-send');
+          if (btn) { btn.click(); return true; }
+          return false;
+        });
+        if (otpSent) {
+          log('SUCCESS', '[AUTOBOOK] OTP send button clicked!');
+        }
+        
+        await new Promise(r => setTimeout(r, 3000));
+        await this.takeScreenshot('06-otp-step');
+        
+        // Notify user to check email for OTP
+        const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
+        await sendTelegram(
+          `🔐 *OTP REQUIS!* 🔐\n\n` +
+          `Le bot a réservé un créneau!\n` +
+          `Un code OTP a été envoyé à votre email.\n\n` +
+          `⚠️ Vérifiez votre email MAINTENANT et entrez le code OTP sur le site.\n\n` +
+          `⏰ ${timeStr}`
+        );
+        
+        // Wait for user to enter OTP (poll for 5 minutes)
+        log('INFO', '[AUTOBOOK] Waiting for OTP to be entered (5 min timeout)...');
+        const otpDeadline = Date.now() + 300000; // 5 minutes
+        while (Date.now() < otpDeadline) {
+          await new Promise(r => setTimeout(r, 10000)); // Check every 10s
+          const url = this.page.url();
+          const text = await this.page.evaluate(() => document.body.innerText);
+          if (text.includes('I miei appuntamenti') || url.includes('/Reservation')) {
+            log('SUCCESS', '🎉🎉🎉 BOOKING CONFIRMED! 🎉🎉🎉');
+            await this.takeScreenshot('07-booking-confirmed');
+            await sendTelegram('🎉 *RENDEZ-VOUS CONFIRMÉ!* 🎉\n\nLe créneau a été réservé avec succès!');
+            return true;
+          }
+        }
+        log('WARNING', '[AUTOBOOK] OTP timeout after 5 minutes.');
+        return false;
+      }
+
+      // Step 8: Check if booking was successful (no OTP step)
+      const finalUrl = this.page.url();
+      const finalText = await this.page.evaluate(() => document.body.innerText);
+      await this.takeScreenshot('07-final-state');
+      
+      if (finalText.includes('I miei appuntamenti') || finalUrl.includes('/Reservation') || finalText.includes('Conferma')) {
+        log('SUCCESS', '🎉🎉🎉 BOOKING APPEARS SUCCESSFUL! 🎉🎉🎉');
+        const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
+        await sendTelegram(
+          `🎉 *RENDEZ-VOUS RÉSERVÉ!* 🎉\n\n` +
+          `Le bot a automatiquement réservé un créneau!\n` +
+          `Vérifiez sur: https://prenotami.esteri.it/Reservation\n\n` +
+          `⏰ ${timeStr}`
+        );
+        return true;
+      }
+
+      log('INFO', `[AUTOBOOK] Final URL: ${finalUrl}`);
+      log('INFO', `[AUTOBOOK] Final page text: ${finalText.substring(0, 500)}`);
+      return false;
+
+    } catch (error) {
+      log('ERROR', `[AUTOBOOK] Error: ${error.message}`);
+      await this.takeScreenshot('error-autobook');
+      return false;
+    }
+  }
+
   async checkAvailability() {
     this.checkCount++;
     log('CHECK', `Check #${this.checkCount} — Loading booking page...`);
@@ -399,19 +767,31 @@ class PrenotamiMonitor {
       log('INFO', `URL: ${currentUrl}`);
       log('INFO', `Page text: ${pageText.substring(0, 500)}`);
 
+      // Always notify
       const now = Date.now();
+      const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
       if (now - this.lastNotificationTime > this.notificationCooldown) {
-        const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
         const message = 
           `🚨 *PRENOTAMI ALERT* 🚨\n\n` +
           `Des créneaux LEGALIZZAZIONI sont disponibles!\n` +
-          `Connectez-vous MAINTENANT:\n${CONFIG.bookingUrl}\n\n` +
+          `${CONFIG.autoBook ? '🤖 Auto-booking en cours...' : 'Connectez-vous MAINTENANT:'}\n${CONFIG.bookingUrl}\n\n` +
           `⏰ ${timeStr}`;
-
         await notify(message);
         this.lastNotificationTime = now;
-      } else {
-        playAlarm();
+      }
+
+      // AUTO-BOOK if enabled
+      if (CONFIG.autoBook) {
+        const booked = await this.autoBook();
+        if (booked) {
+          log('SUCCESS', '🎉 Auto-booking successful! Pausing monitoring for 1 hour...');
+          await new Promise(r => setTimeout(r, 3600000)); // pause 1h after successful booking
+          this.consecutiveErrors = 0;
+          return 'BOOKED';
+        } else {
+          log('WARNING', 'Auto-booking failed. Will notify and continue monitoring...');
+          await sendTelegram(`⚠️ Auto-booking a échoué!\nVérifiez manuellement: ${CONFIG.bookingUrl}`);
+        }
       }
 
       this.consecutiveErrors = 0;
@@ -437,8 +817,9 @@ class PrenotamiMonitor {
     }
 
     log('INFO', '='.repeat(60));
-    log('INFO', 'PRENOTAMI APPOINTMENT MONITOR v2');
+    log('INFO', 'PRENOTAMI APPOINTMENT MONITOR v3 — AUTO-BOOKING');
     log('INFO', `Booking URL: ${CONFIG.bookingUrl}`);
+    log('INFO', `Auto-booking: ${CONFIG.autoBook ? '✅ ENABLED' : '❌ DISABLED'}`);
     log('INFO', `Check interval: ${CONFIG.checkInterval / 1000} seconds`);
     log('INFO', `Notifications: ${CONFIG.telegramBotToken ? 'Telegram ✅' : 'Telegram ❌'} | Sound ✅`);
     log('INFO', `Auto-login: ${CONFIG.email ? '✅' : '❌'}`);
