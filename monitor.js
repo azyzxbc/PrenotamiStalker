@@ -66,10 +66,13 @@ const CONFIG = {
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
   checkInterval: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
   bookingUrl: process.env.BOOKING_URL || 'https://prenotami.esteri.it/Services/Booking/2359',
+  serviceId: process.env.SERVICE_ID || '2359',
   loginUrl: 'https://prenotami.esteri.it/Home',
   noSlotsMessage: 'Sorry, all appointments for this service are currently booked',
   autoBook: (process.env.AUTO_BOOK || 'true').toLowerCase() === 'true',
   bookingNote: process.env.BOOKING_NOTE || '',
+  // Waiting list: try these services to find an accessible form
+  waitingListDonorServices: [1167, 2356, 2357, 2358, 5111],
 };
 
 // ============================================================================
@@ -705,6 +708,248 @@ class PrenotamiMonitor {
     }
   }
 
+  // ========================================================================
+  // WAITING LIST: Join the waiting list by submitting via donor service form
+  // ========================================================================
+
+  async joinWaitingList() {
+    log('INFO', '📋 WAITING LIST: Attempting to join the waiting list for service ' + CONFIG.serviceId + '...');
+
+    try {
+      // Step 1: Find an accessible service that shows the booking form
+      let donorServiceId = null;
+      for (const svcId of CONFIG.waitingListDonorServices) {
+        log('INFO', `[WL] Trying donor service ${svcId}...`);
+        await this.page.goto(`https://prenotami.esteri.it/Services/Booking/${svcId}`, {
+          waitUntil: 'networkidle2',
+          timeout: 20000,
+        });
+        await new Promise(r => setTimeout(r, 2000));
+
+        const url = this.page.url();
+        const hasForm = await this.page.evaluate(() => !!document.getElementById('bookingForm'));
+
+        if (hasForm && url.includes(`Booking/${svcId}`)) {
+          donorServiceId = svcId;
+          log('SUCCESS', `[WL] Found accessible donor service: ${svcId}`);
+          break;
+        } else {
+          log('INFO', `[WL] Service ${svcId} not accessible (redirected to ${url.substring(0, 60)})`);
+        }
+      }
+
+      if (!donorServiceId) {
+        log('ERROR', '[WL] No accessible donor service found! Cannot join waiting list.');
+        return false;
+      }
+
+      await this.takeScreenshot('wl-01-donor-form');
+
+      // Step 2: Rewrite the form to target our service (2359)
+      const targetServiceId = CONFIG.serviceId;
+      const rewriteResult = await this.page.evaluate((targetId) => {
+        const form = document.getElementById('bookingForm');
+        if (!form) return { success: false, error: 'No bookingForm found' };
+
+        // Change form action to target service
+        form.action = `/Services/Booking/${targetId}`;
+
+        // Update hidden service ID fields
+        const svcField = document.getElementById('IDServizioErogato');
+        if (svcField) svcField.value = targetId;
+
+        // Ensure waiting list is enabled
+        const wlField = document.getElementById('isWaitingListEnabled');
+        if (wlField) wlField.value = 'True';
+
+        return {
+          success: true,
+          action: form.action,
+          serviceId: svcField ? svcField.value : 'not found',
+          waitingList: wlField ? wlField.value : 'not found',
+        };
+      }, targetServiceId);
+
+      if (!rewriteResult.success) {
+        log('ERROR', `[WL] Form rewrite failed: ${rewriteResult.error}`);
+        return false;
+      }
+      log('SUCCESS', `[WL] Form rewritten → action: ${rewriteResult.action}, serviceId: ${rewriteResult.serviceId}`);
+
+      // Step 3: Select booking type (first non-zero option)
+      await this.page.evaluate(() => {
+        const ddl = document.getElementById('typeofbookingddl');
+        if (ddl) {
+          for (let i = 0; i < ddl.options.length; i++) {
+            if (ddl.options[i].value !== '0' && ddl.options[i].value !== '') {
+              ddl.selectedIndex = i;
+              ddl.dispatchEvent(new Event('change', { bubbles: true }));
+              break;
+            }
+          }
+        }
+      });
+      await new Promise(r => setTimeout(r, 1000));
+
+      // Step 4: Fill required additional data fields with safe defaults
+      const filledFields = await this.page.evaluate((note) => {
+        const filled = [];
+        // Text inputs
+        document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="text"]').forEach(input => {
+          if (!input.value && input.offsetParent !== null) {
+            input.value = note || 'N/A';
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            filled.push(input.name || input.id);
+          }
+        });
+        // Date inputs
+        document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="date"]').forEach(input => {
+          if (!input.value && input.offsetParent !== null) {
+            const future = new Date();
+            future.setFullYear(future.getFullYear() + 2);
+            input.value = future.toISOString().split('T')[0];
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            filled.push(input.name || input.id);
+          }
+        });
+        // Select dropdowns
+        document.querySelectorAll('select[id*="ddls_"]').forEach(sel => {
+          if (sel.selectedIndex === 0 && sel.offsetParent !== null) {
+            for (let i = 1; i < sel.options.length; i++) {
+              if (sel.options[i].value !== '0') {
+                sel.selectedIndex = i;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                filled.push(sel.id);
+                break;
+              }
+            }
+          }
+        });
+        return filled;
+      }, CONFIG.bookingNote);
+      log('INFO', `[WL] Filled ${filledFields.length} fields: ${filledFields.join(', ')}`);
+
+      // Step 5: Fill the "Note per la sede" textarea
+      await this.page.evaluate((note) => {
+        const textarea = document.getElementById('BookingNotes');
+        if (textarea) {
+          textarea.value = note || 'Inscription liste attente - Legalizzazioni';
+          textarea.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, CONFIG.bookingNote);
+
+      // Step 6: Check the privacy checkbox
+      await this.page.evaluate(() => {
+        const checkbox = document.getElementById('PrivacyCheck');
+        if (checkbox && !checkbox.checked) {
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+
+      await this.takeScreenshot('wl-02-form-filled');
+      log('SUCCESS', '[WL] Form filled and privacy accepted.');
+
+      // Step 7: Override window.confirm to auto-accept
+      await this.page.evaluate(() => {
+        window.confirm = () => true;
+      });
+
+      // Step 8: Click AVANTI to submit
+      const hasAvanti = await this.page.evaluate(() => !!document.getElementById('btnAvanti'));
+      if (!hasAvanti) {
+        log('ERROR', '[WL] No #btnAvanti button found!');
+        return false;
+      }
+
+      log('INFO', '[WL] Clicking AVANTI...');
+      const navPromise = this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => null);
+      await this.page.click('#btnAvanti');
+      await new Promise(r => setTimeout(r, 3000));
+      await navPromise;
+      await new Promise(r => setTimeout(r, 3000));
+
+      await this.takeScreenshot('wl-03-after-submit');
+      const afterUrl = this.page.url();
+      const afterText = await this.page.evaluate(() => document.body.innerText);
+      log('INFO', `[WL] After submit URL: ${afterUrl}`);
+      log('INFO', `[WL] After submit text (300 chars): ${afterText.substring(0, 300)}`);
+
+      // Step 9: Check for OTP step
+      const hasOtpSection = await this.page.evaluate(() => {
+        const html = document.body.innerHTML;
+        return html.includes('OTP') || html.includes('otp-send') || html.includes('GenerateOTP');
+      });
+
+      if (hasOtpSection) {
+        log('SUCCESS', '🔐 [WL] OTP step detected!');
+
+        // Click send OTP button
+        const otpClicked = await this.page.evaluate(() => {
+          const btn = document.getElementById('otp-send');
+          if (btn) { btn.click(); return true; }
+          return false;
+        });
+        if (otpClicked) log('SUCCESS', '[WL] OTP send button clicked!');
+
+        await new Promise(r => setTimeout(r, 3000));
+        await this.takeScreenshot('wl-04-otp');
+
+        const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
+        await sendTelegram(
+          `📋🔐 *LISTE D'ATTENTE - OTP REQUIS!* 🔐\n\n` +
+          `Le bot tente de s'inscrire à la liste d'attente!\n` +
+          `Un code OTP a été envoyé à votre email.\n\n` +
+          `⚠️ Vérifiez votre email MAINTENANT et entrez le code.\n\n` +
+          `⏰ ${timeStr}`
+        );
+        await notify('📋 OTP requis pour la liste d\'attente! Vérifiez votre email!');
+
+        // Wait for user to enter OTP (5 min)
+        const otpDeadline = Date.now() + 300000;
+        while (Date.now() < otpDeadline) {
+          await new Promise(r => setTimeout(r, 10000));
+          const text = await this.page.evaluate(() => document.body.innerText);
+          const url = this.page.url();
+          if (text.includes('I miei appuntamenti') || url.includes('/Reservation') ||
+              text.includes('lista di attesa') || text.includes('waiting list') ||
+              text.includes('Conferma')) {
+            log('SUCCESS', '🎉 [WL] Waiting list registration appears successful!');
+            await this.takeScreenshot('wl-05-success');
+            await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉\n\nVous êtes inscrit sur la liste d\'attente!');
+            return true;
+          }
+        }
+        log('WARNING', '[WL] OTP timeout after 5 minutes.');
+        return false;
+      }
+
+      // Step 10: Check result (no OTP step)
+      if (afterText.includes('lista di attesa') || afterText.includes('waiting list') ||
+          afterText.includes('Conferma') || afterText.includes('I miei appuntamenti') ||
+          afterUrl.includes('/Reservation')) {
+        log('SUCCESS', '🎉 [WL] Waiting list registration successful!');
+        await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉\n\nVous êtes inscrit sur la liste d\'attente pour Legalizzazioni!');
+        return true;
+      }
+
+      // Check for errors
+      if (afterText.includes('Errore') || afterText.includes('error') || afterText.includes('Invalid')) {
+        log('ERROR', `[WL] Server returned an error: ${afterText.substring(0, 500)}`);
+        await this.takeScreenshot('wl-error');
+        return false;
+      }
+
+      log('INFO', '[WL] Unknown result. Check screenshots.');
+      return false;
+
+    } catch (error) {
+      log('ERROR', `[WL] Error: ${error.message}`);
+      await this.takeScreenshot('wl-error');
+      return false;
+    }
+  }
+
   async checkAvailability() {
     this.checkCount++;
     log('CHECK', `Check #${this.checkCount} — Loading booking page...`);
@@ -906,6 +1151,46 @@ async function main() {
     playAlarm();
     await new Promise(r => setTimeout(r, 12000));
     process.exit(0);
+  }
+
+  // Waiting List: try to join the waiting list directly
+  if (args.includes('--waiting-list')) {
+    log('INFO', '='.repeat(60));
+    log('INFO', '📋 WAITING LIST MODE');
+    log('INFO', `Target service: ${CONFIG.serviceId}`);
+    log('INFO', '='.repeat(60));
+
+    if (!CONFIG.email || !CONFIG.password) {
+      log('ERROR', 'Missing PRENOTAMI_EMAIL or PRENOTAMI_PASSWORD in .env!');
+      process.exit(1);
+    }
+
+    const monitor = new PrenotamiMonitor();
+    await monitor.init();
+
+    // Login first
+    let loggedIn = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      log('INFO', `Login attempt ${attempt}/3...`);
+      loggedIn = await monitor.login();
+      if (loggedIn) break;
+      if (attempt < 3) await new Promise(r => setTimeout(r, 15000));
+    }
+    if (!loggedIn) {
+      log('ERROR', 'Login failed!');
+      process.exit(1);
+    }
+
+    // Try to join waiting list
+    const success = await monitor.joinWaitingList();
+    if (success) {
+      log('SUCCESS', '🎉 Successfully joined the waiting list!');
+    } else {
+      log('ERROR', 'Failed to join waiting list. Check screenshots for details.');
+    }
+
+    await monitor.cleanup();
+    process.exit(success ? 0 : 1);
   }
 
   // Setup: open Chrome with separate profile for manual login
