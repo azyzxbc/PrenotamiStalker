@@ -64,7 +64,7 @@ const CONFIG = {
   password: process.env.PRENOTAMI_PASSWORD,
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
-  checkInterval: parseInt(process.env.CHECK_INTERVAL_MS) || 120000,
+  checkInterval: parseInt(process.env.CHECK_INTERVAL_MS) || 10000,
   bookingUrl: process.env.BOOKING_URL || 'https://prenotami.esteri.it/Services/Booking/2359',
   serviceId: process.env.SERVICE_ID || '2359',
   loginUrl: 'https://prenotami.esteri.it/Home',
