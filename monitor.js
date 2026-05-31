@@ -154,7 +154,6 @@ function sendTelegramPhoto(imagePath, caption) {
     }
     try {
       const http = require('https');
-      const FormData = require('form-data') || null;
       // Use multipart manually since form-data might not be installed
       const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
       const fileData = fs.readFileSync(imagePath);
@@ -709,74 +708,123 @@ class PrenotamiMonitor {
   }
 
   // ========================================================================
-  // WAITING LIST: Join the waiting list by submitting via donor service form
+  // WAITING LIST: Join the waiting list by fetching the real form for 2359
   // ========================================================================
 
   async joinWaitingList() {
     log('INFO', '📋 WAITING LIST: Attempting to join the waiting list for service ' + CONFIG.serviceId + '...');
 
     try {
-      // Step 1: Find an accessible service that shows the booking form
-      let donorServiceId = null;
-      for (const svcId of CONFIG.waitingListDonorServices) {
-        log('INFO', `[WL] Trying donor service ${svcId}...`);
-        await this.page.goto(`https://prenotami.esteri.it/Services/Booking/${svcId}`, {
-          waitUntil: 'networkidle2',
-          timeout: 20000,
+      // Step 1: Ensure we're on prenotami (for cookies)
+      await this.page.goto('https://prenotami.esteri.it/Services', {
+        waitUntil: 'networkidle2',
+        timeout: 30000,
+      });
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Step 2: Fetch the booking page HTML directly via XHR (shares cookies, doesn't redirect the browser)
+      log('INFO', '[WL] Fetching booking form HTML for service ' + CONFIG.serviceId + '...');
+      const formHtml = await this.page.evaluate(async (serviceId) => {
+        return new Promise((resolve) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', `/Services/Booking/${serviceId}`, true);
+          xhr.onload = function () {
+            resolve({ status: xhr.status, html: xhr.responseText, url: xhr.responseURL });
+          };
+          xhr.onerror = function () {
+            resolve({ status: 0, html: null, url: null, error: 'XHR error' });
+          };
+          xhr.send();
         });
-        await new Promise(r => setTimeout(r, 2000));
+      }, CONFIG.serviceId);
 
-        const url = this.page.url();
-        const hasForm = await this.page.evaluate(() => !!document.getElementById('bookingForm'));
+      log('INFO', `[WL] XHR response: status=${formHtml.status}, url=${(formHtml.url || '').substring(0, 80)}, htmlLength=${(formHtml.html || '').length}`);
 
-        if (hasForm && url.includes(`Booking/${svcId}`)) {
-          donorServiceId = svcId;
-          log('SUCCESS', `[WL] Found accessible donor service: ${svcId}`);
-          break;
+      // Check if we got the actual booking form or a redirect/error page
+      const hasBookingForm = formHtml.html && formHtml.html.includes('bookingForm');
+      const hasWaitingList = formHtml.html && formHtml.html.includes('isWaitingListEnabled');
+      const isErrorPage = formHtml.html && (formHtml.html.includes('Si è verificato un errore') || formHtml.url?.includes('/Error'));
+
+      if (isErrorPage) {
+        log('ERROR', '[WL] Server returned an error page.');
+        return false;
+      }
+
+      if (!formHtml.html || formHtml.html.length < 500) {
+        log('ERROR', '[WL] Got empty or very short response. Service may not be accessible.');
+        return false;
+      }
+
+      if (!hasBookingForm) {
+        // The XHR followed the redirect — we got the redirected page, not the form
+        log('WARNING', `[WL] No booking form found in response. Page may have redirected.`);
+        log('INFO', `[WL] Response URL: ${formHtml.url}`);
+        
+        // Try direct POST with minimal data
+        log('INFO', '[WL] Attempting direct POST to booking endpoint...');
+        const postResult = await this.page.evaluate(async (serviceId, note) => {
+          return new Promise((resolve) => {
+            const formData = new FormData();
+            formData.append('IDServizioErogato', serviceId);
+            formData.append('isWaitingListEnabled', 'True');
+            formData.append('MessaggioRassicuranteWaitingList', 'True');
+            formData.append('PrivacyCheck', 'true');
+            formData.append('BookingNotes', note || '');
+            formData.append('IdTipoPrenotazione', '1');
+            formData.append('NumAccompagnatoriSelected', '0');
+            formData.append('NumMaxAccompagnatori', '0');
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `/Services/Booking/${serviceId}`, true);
+            xhr.onload = function () {
+              resolve({ status: xhr.status, text: xhr.responseText.substring(0, 2000), url: xhr.responseURL });
+            };
+            xhr.onerror = function () {
+              resolve({ status: 0, text: 'XHR POST error', url: null });
+            };
+            xhr.send(formData);
+          });
+        }, CONFIG.serviceId, CONFIG.bookingNote);
+
+        log('INFO', `[WL] POST response: status=${postResult.status}, url=${(postResult.url || '').substring(0, 80)}`);
+        log('INFO', `[WL] POST response text (500 chars): ${(postResult.text || '').substring(0, 500)}`);
+
+        if (postResult.text?.includes('OTP') || postResult.text?.includes('otp')) {
+          log('SUCCESS', '🔐 [WL] POST triggered OTP step!');
+          // Navigate to the current state
+          await this.page.goto(postResult.url || `https://prenotami.esteri.it/Services/Booking/${CONFIG.serviceId}`, {
+            waitUntil: 'networkidle2', timeout: 15000
+          }).catch(() => {});
+          // OTP handling logic is lower down, this is just to get to the page
+        } else if (postResult.text?.includes('lista di attesa') || postResult.text?.includes('waiting')) {
+          log('SUCCESS', '🎉 [WL] Direct POST worked! On waiting list!');
+          await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉\n\nInscrit sur la liste d\'attente pour Legalizzazioni!');
+          return true;
+        } else if (postResult.status === 200 && !postResult.text?.includes('Errore') && !postResult.text?.includes('error')) {
+          log('INFO', '[WL] POST returned 200. Checking result...');
+          await this.takeScreenshot('wl-post-result');
         } else {
-          log('INFO', `[WL] Service ${svcId} not accessible (redirected to ${url.substring(0, 60)})`);
+          log('WARNING', `[WL] POST didn't succeed clearly. Status: ${postResult.status}`);
+          await this.takeScreenshot('wl-post-unclear');
         }
-      }
-
-      if (!donorServiceId) {
-        log('ERROR', '[WL] No accessible donor service found! Cannot join waiting list.');
         return false;
       }
 
-      await this.takeScreenshot('wl-01-donor-form');
+      // Step 3: We got the booking form! Inject it into the current page
+      log('SUCCESS', '[WL] Got the booking form for service ' + CONFIG.serviceId + '!');
+      log('INFO', `[WL] Waiting list enabled: ${hasWaitingList}`);
 
-      // Step 2: Rewrite the form to target our service (2359)
-      const targetServiceId = CONFIG.serviceId;
-      const rewriteResult = await this.page.evaluate((targetId) => {
-        const form = document.getElementById('bookingForm');
-        if (!form) return { success: false, error: 'No bookingForm found' };
+      // Replace current page content with the form
+      await this.page.evaluate((html) => {
+        document.open();
+        document.write(html);
+        document.close();
+      }, formHtml.html);
+      await new Promise(r => setTimeout(r, 3000));
 
-        // Change form action to target service
-        form.action = `/Services/Booking/${targetId}`;
+      await this.takeScreenshot('wl-01-real-form');
 
-        // Update hidden service ID fields
-        const svcField = document.getElementById('IDServizioErogato');
-        if (svcField) svcField.value = targetId;
-
-        // Ensure waiting list is enabled
-        const wlField = document.getElementById('isWaitingListEnabled');
-        if (wlField) wlField.value = 'True';
-
-        return {
-          success: true,
-          action: form.action,
-          serviceId: svcField ? svcField.value : 'not found',
-          waitingList: wlField ? wlField.value : 'not found',
-        };
-      }, targetServiceId);
-
-      if (!rewriteResult.success) {
-        log('ERROR', `[WL] Form rewrite failed: ${rewriteResult.error}`);
-        return false;
-      }
-      log('SUCCESS', `[WL] Form rewritten → action: ${rewriteResult.action}, serviceId: ${rewriteResult.serviceId}`);
-
-      // Step 3: Select booking type (first non-zero option)
+      // Step 4: Select booking type (first non-zero option)
       await this.page.evaluate(() => {
         const ddl = document.getElementById('typeofbookingddl');
         if (ddl) {
@@ -791,10 +839,9 @@ class PrenotamiMonitor {
       });
       await new Promise(r => setTimeout(r, 1000));
 
-      // Step 4: Fill required additional data fields with safe defaults
+      // Step 5: Fill required additional data fields
       const filledFields = await this.page.evaluate((note) => {
         const filled = [];
-        // Text inputs
         document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="text"]').forEach(input => {
           if (!input.value && input.offsetParent !== null) {
             input.value = note || 'N/A';
@@ -802,7 +849,6 @@ class PrenotamiMonitor {
             filled.push(input.name || input.id);
           }
         });
-        // Date inputs
         document.querySelectorAll('input[id*="DatiAddizionaliPrenotante"][type="date"]').forEach(input => {
           if (!input.value && input.offsetParent !== null) {
             const future = new Date();
@@ -812,7 +858,6 @@ class PrenotamiMonitor {
             filled.push(input.name || input.id);
           }
         });
-        // Select dropdowns
         document.querySelectorAll('select[id*="ddls_"]').forEach(sel => {
           if (sel.selectedIndex === 0 && sel.offsetParent !== null) {
             for (let i = 1; i < sel.options.length; i++) {
@@ -829,36 +874,30 @@ class PrenotamiMonitor {
       }, CONFIG.bookingNote);
       log('INFO', `[WL] Filled ${filledFields.length} fields: ${filledFields.join(', ')}`);
 
-      // Step 5: Fill the "Note per la sede" textarea
+      // Step 6: Fill notes
       await this.page.evaluate((note) => {
         const textarea = document.getElementById('BookingNotes');
-        if (textarea) {
-          textarea.value = note || 'Inscription liste attente - Legalizzazioni';
-          textarea.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+        if (textarea) textarea.value = note || '';
       }, CONFIG.bookingNote);
 
-      // Step 6: Check the privacy checkbox
+      // Step 7: Check privacy
       await this.page.evaluate(() => {
-        const checkbox = document.getElementById('PrivacyCheck');
-        if (checkbox && !checkbox.checked) {
-          checkbox.checked = true;
-          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+        const cb = document.getElementById('PrivacyCheck');
+        if (cb && !cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
         }
       });
 
       await this.takeScreenshot('wl-02-form-filled');
       log('SUCCESS', '[WL] Form filled and privacy accepted.');
 
-      // Step 7: Override window.confirm to auto-accept
-      await this.page.evaluate(() => {
-        window.confirm = () => true;
-      });
+      // Step 8: Override confirm and click AVANTI
+      await this.page.evaluate(() => { window.confirm = () => true; });
 
-      // Step 8: Click AVANTI to submit
       const hasAvanti = await this.page.evaluate(() => !!document.getElementById('btnAvanti'));
       if (!hasAvanti) {
-        log('ERROR', '[WL] No #btnAvanti button found!');
+        log('ERROR', '[WL] No #btnAvanti found!');
         return false;
       }
 
@@ -873,18 +912,21 @@ class PrenotamiMonitor {
       const afterUrl = this.page.url();
       const afterText = await this.page.evaluate(() => document.body.innerText);
       log('INFO', `[WL] After submit URL: ${afterUrl}`);
-      log('INFO', `[WL] After submit text (300 chars): ${afterText.substring(0, 300)}`);
+      log('INFO', `[WL] After submit text (500 chars): ${afterText.substring(0, 500)}`);
 
-      // Step 9: Check for OTP step
-      const hasOtpSection = await this.page.evaluate(() => {
-        const html = document.body.innerHTML;
-        return html.includes('OTP') || html.includes('otp-send') || html.includes('GenerateOTP');
-      });
+      // Check for error
+      if (afterUrl.includes('/Error') || afterText.includes('Si è verificato un errore')) {
+        log('ERROR', '[WL] Server returned an error page after form submit.');
+        log('ERROR', `[WL] Error text: ${afterText.substring(0, 300)}`);
+        return false;
+      }
+
+      // Step 9: Handle OTP
+      const hasOtpSection = afterText.includes('OTP') || 
+        await this.page.evaluate(() => document.body.innerHTML.includes('otp-send') || document.body.innerHTML.includes('GenerateOTP'));
 
       if (hasOtpSection) {
         log('SUCCESS', '🔐 [WL] OTP step detected!');
-
-        // Click send OTP button
         const otpClicked = await this.page.evaluate(() => {
           const btn = document.getElementById('otp-send');
           if (btn) { btn.click(); return true; }
@@ -898,25 +940,22 @@ class PrenotamiMonitor {
         const timeStr = new Date().toLocaleString('fr-FR', { timeZone: 'Africa/Algiers' });
         await sendTelegram(
           `📋🔐 *LISTE D'ATTENTE - OTP REQUIS!* 🔐\n\n` +
-          `Le bot tente de s'inscrire à la liste d'attente!\n` +
+          `Le bot s'inscrit à la liste d'attente!\n` +
           `Un code OTP a été envoyé à votre email.\n\n` +
-          `⚠️ Vérifiez votre email MAINTENANT et entrez le code.\n\n` +
-          `⏰ ${timeStr}`
+          `⚠️ Vérifiez votre email MAINTENANT!\n\n⏰ ${timeStr}`
         );
-        await notify('📋 OTP requis pour la liste d\'attente! Vérifiez votre email!');
+        await notify('📋 OTP requis! Vérifiez votre email!');
 
-        // Wait for user to enter OTP (5 min)
         const otpDeadline = Date.now() + 300000;
         while (Date.now() < otpDeadline) {
           await new Promise(r => setTimeout(r, 10000));
           const text = await this.page.evaluate(() => document.body.innerText);
           const url = this.page.url();
-          if (text.includes('I miei appuntamenti') || url.includes('/Reservation') ||
-              text.includes('lista di attesa') || text.includes('waiting list') ||
-              text.includes('Conferma')) {
-            log('SUCCESS', '🎉 [WL] Waiting list registration appears successful!');
+          if (url.includes('/Reservation') || text.includes('lista di attesa') || 
+              text.includes('Conferma') || text.includes('confermato') || text.includes('I miei appuntamenti')) {
+            log('SUCCESS', '🎉 [WL] Waiting list registration confirmed!');
             await this.takeScreenshot('wl-05-success');
-            await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉\n\nVous êtes inscrit sur la liste d\'attente!');
+            await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉');
             return true;
           }
         }
@@ -924,23 +963,16 @@ class PrenotamiMonitor {
         return false;
       }
 
-      // Step 10: Check result (no OTP step)
-      if (afterText.includes('lista di attesa') || afterText.includes('waiting list') ||
-          afterText.includes('Conferma') || afterText.includes('I miei appuntamenti') ||
-          afterUrl.includes('/Reservation')) {
-        log('SUCCESS', '🎉 [WL] Waiting list registration successful!');
-        await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉\n\nVous êtes inscrit sur la liste d\'attente pour Legalizzazioni!');
+      // Step 10: Check final result
+      if (afterUrl.includes('/Reservation') || afterText.includes('lista di attesa') ||
+          afterText.includes('confermato') || afterText.includes('I miei appuntamenti')) {
+        log('SUCCESS', '🎉 [WL] Registration successful!');
+        await sendTelegram('🎉 *LISTE D\'ATTENTE CONFIRMÉE!* 🎉');
         return true;
       }
 
-      // Check for errors
-      if (afterText.includes('Errore') || afterText.includes('error') || afterText.includes('Invalid')) {
-        log('ERROR', `[WL] Server returned an error: ${afterText.substring(0, 500)}`);
-        await this.takeScreenshot('wl-error');
-        return false;
-      }
-
-      log('INFO', '[WL] Unknown result. Check screenshots.');
+      log('WARNING', '[WL] Unclear result. Check screenshots.');
+      log('INFO', `[WL] Final text: ${afterText.substring(0, 500)}`);
       return false;
 
     } catch (error) {
