@@ -3,7 +3,7 @@ module.exports = {
     name: 'prenotami-stalker',
     script: 'monitor.js',
     interpreter: 'xvfb-run',
-    interpreter_args: '-a',
+    interpreter_args: '-a node',
     autorestart: true,
     max_restarts: 50,
     min_uptime: '10s',
