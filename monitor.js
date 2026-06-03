@@ -241,7 +241,6 @@ class PrenotamiMonitor {
       process.exit(1);
     }
 
-    // Use a dedicated profile inside the project folder
     const profileDir = path.join(__dirname, 'chrome-profile');
     if (!fs.existsSync(profileDir)) {
       fs.mkdirSync(profileDir, { recursive: true });
@@ -262,12 +261,8 @@ class PrenotamiMonitor {
     ];
     if (offscreen) args.push('--window-position=-2000,-2000');
 
-    // Use 'new' headless (Chrome's built-in headless, undetectable)
-    // Falls back to headful+offscreen if HEADLESS=false in .env
-    const useHeadless = process.env.HEADLESS !== 'false';
-
     this.browser = await puppeteer.launch({
-      headless: useHeadless ? 'new' : false,
+      headless: false, // headful mode — use xvfb on VPS
       executablePath: browserPath,
       userDataDir: profileDir,
       args,
@@ -286,21 +281,38 @@ class PrenotamiMonitor {
     // Stealth: remove webdriver flag
     await this.page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      // Override permissions
       const originalQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (parameters) =>
         parameters.name === 'notifications'
           ? Promise.resolve({ state: Notification.permission })
           : originalQuery(parameters);
-      // Chrome runtime
       window.chrome = { runtime: {} };
-      // Languages
       Object.defineProperty(navigator, 'languages', { get: () => ['it-IT', 'it', 'en-US', 'en'] });
-      // Plugins
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
     });
 
-    log('SUCCESS', `Browser launched! (headless: ${useHeadless ? 'new' : 'off'})`);
+    log('SUCCESS', 'Browser launched!');
+  }
+
+  // Wait for PerfDrive challenge to auto-resolve (up to 60s)
+  async waitForPerfDrive() {
+    const url = this.page.url();
+    if (!url.includes('perfdrive.com') && !url.includes('validate.')) return true;
+
+    log('WARNING', '🛡️ PerfDrive challenge detected. Waiting for auto-resolve...');
+    const deadline = Date.now() + 60000; // 60s max
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 5000));
+      const currentUrl = this.page.url();
+      if (!currentUrl.includes('perfdrive.com') && !currentUrl.includes('validate.')) {
+        log('SUCCESS', '🛡️ PerfDrive challenge resolved!');
+        await new Promise(r => setTimeout(r, 2000));
+        return true;
+      }
+      log('INFO', `🛡️ Still on PerfDrive... (${Math.round((deadline - Date.now()) / 1000)}s left)`);
+    }
+    log('ERROR', '🛡️ PerfDrive challenge did NOT resolve in 60s.');
+    return false;
   }
 
   async login() {
@@ -309,10 +321,31 @@ class PrenotamiMonitor {
       await this.page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       const url = this.page.url();
 
-      // Check if actually logged in by looking for user session indicators
+      // Handle PerfDrive if detected
+      if (this.page.url().includes('perfdrive.com') || this.page.url().includes('validate.')) {
+        const resolved = await this.waitForPerfDrive();
+        if (resolved) {
+          // Check if we landed on prenotami after PerfDrive
+          const urlAfter = this.page.url();
+          const loggedInAfter = await this.page.evaluate(() =>
+            document.body.innerText.includes('Disconnetti') || document.body.innerText.includes('I miei appuntamenti')
+          );
+          if (loggedInAfter) {
+            log('SUCCESS', 'Logged in after PerfDrive resolve!');
+            return true;
+          }
+          // Navigate again after PerfDrive resolves
+          await this.page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await new Promise(r => setTimeout(r, 2000));
+        } else {
+          log('ERROR', 'PerfDrive did not resolve. Will retry later.');
+          return false;
+        }
+      }
+
+      // Check if actually logged in
       const isLoggedIn = await this.page.evaluate(() => {
         const text = document.body.innerText;
-        // If we see "Disconnetti" or user menu, we're logged in
         return text.includes('Disconnetti') || text.includes('I miei appuntamenti');
       });
 
@@ -331,7 +364,12 @@ class PrenotamiMonitor {
           return false;
         });
         if (loginClicked) {
-          await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+          await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+          // PerfDrive might trigger again after clicking login
+          if (this.page.url().includes('perfdrive.com') || this.page.url().includes('validate.')) {
+            const resolved2 = await this.waitForPerfDrive();
+            if (!resolved2) return false;
+          }
         }
       }
 
