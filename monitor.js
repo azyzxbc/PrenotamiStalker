@@ -273,24 +273,6 @@ class PrenotamiMonitor {
     this.page = pages[0] || await this.browser.newPage();
     await this.page.setViewport({ width: 1366, height: 768 });
 
-    // Stealth: realistic user-agent
-    await this.page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-    );
-
-    // Stealth: remove webdriver flag
-    await this.page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters);
-      window.chrome = { runtime: {} };
-      Object.defineProperty(navigator, 'languages', { get: () => ['it-IT', 'it', 'en-US', 'en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    });
-
     log('SUCCESS', 'Browser launched!');
   }
 
