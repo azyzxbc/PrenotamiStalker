@@ -64,7 +64,7 @@ const CONFIG = {
   password: process.env.PRENOTAMI_PASSWORD,
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
-  checkInterval: parseInt(process.env.CHECK_INTERVAL_MS) || 10000,
+  checkInterval: parseInt(process.env.CHECK_INTERVAL_MS) || 90000,
   bookingUrl: process.env.BOOKING_URL || 'https://prenotami.esteri.it/Services/Booking/2359',
   serviceId: process.env.SERVICE_ID || '2359',
   loginUrl: 'https://prenotami.esteri.it/Home',
@@ -257,11 +257,17 @@ class PrenotamiMonitor {
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
       '--window-size=1366,768',
+      '--disable-infobars',
+      '--lang=it-IT,it',
     ];
     if (offscreen) args.push('--window-position=-2000,-2000');
 
+    // Use 'new' headless (Chrome's built-in headless, undetectable)
+    // Falls back to headful+offscreen if HEADLESS=false in .env
+    const useHeadless = process.env.HEADLESS !== 'false';
+
     this.browser = await puppeteer.launch({
-      headless: false,
+      headless: useHeadless ? 'new' : false,
       executablePath: browserPath,
       userDataDir: profileDir,
       args,
@@ -272,7 +278,29 @@ class PrenotamiMonitor {
     this.page = pages[0] || await this.browser.newPage();
     await this.page.setViewport({ width: 1366, height: 768 });
 
-    log('SUCCESS', 'Browser launched!');
+    // Stealth: realistic user-agent
+    await this.page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    );
+
+    // Stealth: remove webdriver flag
+    await this.page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+      // Chrome runtime
+      window.chrome = { runtime: {} };
+      // Languages
+      Object.defineProperty(navigator, 'languages', { get: () => ['it-IT', 'it', 'en-US', 'en'] });
+      // Plugins
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    });
+
+    log('SUCCESS', `Browser launched! (headless: ${useHeadless ? 'new' : 'off'})`);
   }
 
   async login() {
@@ -998,6 +1026,19 @@ class PrenotamiMonitor {
       const currentUrl = this.page.url();
       const pageText = await this.page.evaluate(() => document.body.innerText);
       const isLoggedIn = pageText.includes('Disconnetti') || pageText.includes('I miei appuntamenti');
+
+      // PerfDrive bot detection — wait and retry
+      if (currentUrl.includes('perfdrive.com') || currentUrl.includes('validate.')) {
+        log('WARNING', '🛡️ PerfDrive bot detection triggered! Waiting 5 minutes...');
+        await sendTelegram('⚠️ PerfDrive anti-bot déclenché. Pause de 5 min...');
+        // Delete cookies to reset detection
+        const cookies = await this.page.cookies();
+        if (cookies.length > 0) await this.page.deleteCookie(...cookies);
+        await new Promise(r => setTimeout(r, 300000)); // 5 min cooldown
+        // Re-login after cooldown
+        await this.login();
+        return 'SESSION_REFRESHED';
+      }
 
       // If redirected to external login or bot detection page → session expired
       if (currentUrl.includes('iam.esteri.it') || currentUrl.includes('perfdrive.com')) {
